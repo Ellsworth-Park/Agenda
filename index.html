@@ -118,9 +118,13 @@ section.wave{
 }
 .field.edited .edited-dot{display:inline-block}
 .field.edited .resetbtn{display:inline}
+.syncnote{
+  margin-left:auto;font-size:11px;color:var(--ink-soft);
+  font-weight:600;letter-spacing:.05em;font-style:italic;text-transform:none;
+}
 .resetbtn{
   display:none;background:none;border:none;color:var(--gold);
-  font-size:11px;font-weight:600;letter-spacing:.05em;margin-left:auto;
+  font-size:11px;font-weight:600;letter-spacing:.05em;margin-left:8px;
 }
 .field input,.field textarea{
   width:100%;border:none;background:transparent;color:var(--ink);
@@ -262,13 +266,20 @@ const CONFIG = {
   // Tab names in the workbook. If a tab is renamed, update it here.
   TAB: "Data Input",                   // one row per Sunday (main agenda grid)
   TAB_ANNOUNCEMENTS: "Announcements",  // A: date · B: announcements text
-  TAB_BUSINESS: "Business"             // A: date · B/C released+calling · D/E called+calling · F other
+  TAB_BUSINESS: "Business",            // A: date · B/C released+calling · D/E called+calling · F other
+  // Write-back endpoint: deploy the companion Apps Script (conduct-apps-script.gs)
+  // on this spreadsheet as a Web App, then paste its deployment URL here.
+  // Leave SCRIPT_URL empty to run read-only (edits stay on this device).
+  SCRIPT_URL: "https://script.google.com/macros/s/AKfycby7CEG8lA_xNMSER-NnYQRpSQ5tQcQxt37Z9R-w4DgfBZ5VG6MO3VuzXuZobuLYWNFQ/exec",
+  SCRIPT_TOKEN: "609906c7420a59d30e286620"   // must match TOKEN in the Apps Script
 };
 
 // Column letters in the sheet (0 = A, 1 = B, ...)
 const COL = { date:0, conducting:1, topic:2, openingHymn:3, invocation:4,
   sacramentHymn:5, speaker1:6, speaker2:7, musicalNumber:8, speaker3:9,
-  closingHymn:10, benediction:11, chorister:12, organist:13 };
+  closingHymn:10, benediction:11, chorister:12, organist:13,
+  // columns O–Q on the main tab, managed by the app for fields the sheet lacked
+  presiding:14, visiting:15, stakeBusiness:16 };
 
 /* ================= FIELD DEFINITIONS =================
    src: column key = pulled from sheet; null = manual entry
@@ -276,11 +287,11 @@ const COL = { date:0, conducting:1, topic:2, openingHymn:3, invocation:4,
    optional: hidden in meeting mode when empty              */
 const SECTIONS = [
   { num:"I", title:"Welcome & Opening", fields:[
-    {id:"presiding",     label:"Presiding",            src:null, type:"person"},
+    {id:"presiding",     label:"Presiding",            src:"presiding", type:"person"},
     {id:"conducting",    label:"Conducting",           src:"conducting", type:"person"},
     {id:"chorister",     label:"Chorister",            src:"chorister", type:"person"},
     {id:"organist",      label:"Organist",             src:"organist", type:"person"},
-    {id:"visiting",      label:"Visiting Authorities", src:null, type:"person", optional:true},
+    {id:"visiting",      label:"Visiting Authorities", src:"visiting", type:"person", optional:true},
     {id:"announcements", label:"Announcements",        src:"@announcements", type:"long", optional:true},
     {id:"openingHymn",   label:"Opening Hymn",         src:"openingHymn", type:"hymn"},
     {id:"invocation",    label:"Invocation",           src:"invocation", type:"person"},
@@ -288,7 +299,7 @@ const SECTIONS = [
   { num:"II", title:"Ward & Stake Business", fields:[
     {id:"wardBusiness",  label:"Ward Business",        src:"@business", type:"long", optional:true},
     {id:"releases",      label:"Releases & Callings",  src:"@business", type:"long", optional:true},
-    {id:"stakeBusiness", label:"Stake Business",       src:null, type:"long", optional:true},
+    {id:"stakeBusiness", label:"Stake Business",       src:"stakeBusiness", type:"long", optional:true},
     {id:"sacramentHymn", label:"Sacrament Hymn",       src:"sacramentHymn", type:"hymn"},
   ], static:"Blessing and administration of the sacrament"},
   { num:"III", title:"Speakers", fields:[
@@ -451,6 +462,7 @@ async function loadDate(d){
 
   overrides = loadOverrides(key);
   render();
+  flushPending();
 }
 
 /* ================= OVERRIDES ================= */
@@ -464,6 +476,56 @@ function saveOverrides(){
 }
 function valueOf(id){
   return overrides[id] !== undefined ? overrides[id] : (sheetValues[id] || "");
+}
+
+/* ================= WRITE-BACK TO SHEET ================= */
+const pushTimers = {};
+function setNote(wrap, text){
+  if(!wrap) return;
+  const s = wrap.querySelector(".syncnote");
+  if(s) s.textContent = text;
+}
+function queuePush(id, wrap){
+  if(!CONFIG.SCRIPT_URL) return;
+  clearTimeout(pushTimers[id]);
+  setNote(wrap, "");
+  pushTimers[id] = setTimeout(()=>pushField(id, wrap), 1200);
+}
+async function pushField(id, wrap){
+  if(overrides[id] === undefined){ setNote(wrap, ""); return; }
+  const value = overrides[id];
+  setNote(wrap, "saving…");
+  let res = null;
+  try{
+    const r = await fetch(CONFIG.SCRIPT_URL, {
+      method:"POST",
+      headers:{"Content-Type":"text/plain;charset=utf-8"},
+      body: JSON.stringify({token:CONFIG.SCRIPT_TOKEN, date:fmtKey(meetingDate), updates:{[id]:value}})
+    });
+    res = await r.json();
+  }catch(e){ res = null; }
+  const status = res && res.ok && res.results ? res.results[id] : null;
+  if(status === "ok"){
+    sheetValues[id] = value;
+    if(overrides[id] === value) delete overrides[id];
+    saveOverrides();
+    tabCache = {};   // sheet changed; refetch on next date load
+    if(wrap) wrap.classList.remove("edited");
+    setNote(wrap, "saved to sheet ✓");
+    setTimeout(()=>{ if(overrides[id]===undefined) setNote(wrap, ""); }, 2500);
+  }else if(status === "skipped"){
+    setNote(wrap, "kept on device");
+  }else{
+    setNote(wrap, "offline — kept on device");
+  }
+}
+// Re-attempt any edits that didn't reach the sheet last time
+function flushPending(){
+  if(!CONFIG.SCRIPT_URL) return;
+  for(const id of Object.keys(overrides)){
+    const el = document.getElementById("in-"+id);
+    pushField(id, el ? el.closest(".field") : null);
+  }
 }
 
 /* ================= OVERVIEW RENDER ================= */
@@ -496,7 +558,7 @@ function render(){
       wrap.className = "field" + (f.type==="hymn" ? " hymn":"") + (overrides[f.id]!==undefined ? " edited":"");
       const lab = document.createElement("label");
       lab.htmlFor = "in-"+f.id;
-      lab.innerHTML = `${f.label} <span class="edited-dot" title="edited locally"></span>`;
+      lab.innerHTML = `${f.label} <span class="edited-dot" title="not yet saved to sheet"></span><span class="syncnote"></span>`;
       const reset = document.createElement("button");
       reset.className = "resetbtn"; reset.type="button"; reset.textContent = "reset";
       reset.onclick = ()=>{ delete overrides[f.id]; saveOverrides(); render(); };
@@ -513,6 +575,7 @@ function render(){
         wrap.classList.toggle("edited", overrides[f.id]!==undefined);
         saveOverrides();
         if(f.type==="long") autoGrow(input);
+        queuePush(f.id, wrap);
       });
       wrap.append(lab, input);
       el.appendChild(wrap);
